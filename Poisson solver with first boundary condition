@@ -217,25 +217,14 @@ double inn_product(double d[g*g],double q[g*g]){
 	  rho[i] = -rho_ref_func( amp, (i%k)*dx, L-(i/k)*dx );
 	  phi_ref[i] = phi_ref_func( amp, (i%k)*dx, L-(i/k)*dx );
  	}
-// 	for(int i=0;i<N;i++)
-// 	{
-// 		printf("%10.3e  ",rho[i]);
-// 		if(i%k==k-1)
-// 		printf("\n");
-//	 }
-// 	printf("\n\n\n");
+
 	
  	
     phi_BC(phi);   
 	// use rho to force phi maintaining boundary condition 
 	rho_BC(rho);
 	
-//	for(int i=0;i<N;i++)
-// 	{
-// 		printf("%10.3e  ",rho[i]);
-// 		if(i%k==k-1)
-// 		printf("\n");
-//	 }
+
 	
 	// extract the inner part which we need solve
 	 
@@ -308,12 +297,7 @@ double inn_product(double d[g*g],double q[g*g]){
  	
   	
 
-//	for(int i=0;i<N;i++)
-// 	{
-// 		printf("%10.3e  ",phi[i]);
-// 		if(i%k==k-1)
-// 		printf("\n");
-//    }
+
 
   printf("steps = %d  fin_err= %10.3e \n",steps, err);
   return EXIT_SUCCESS;
