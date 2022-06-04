@@ -1,0 +1,509 @@
+#include <cstdio>
+#include <cstdlib>
+#include <omp.h>
+#include <iostream>
+#include <cmath>
+
+using namespace std;
+
+//constants
+   double L   = 1;   // 1-D computational domain size
+   const int k   = 128;   // number of equally spaced sampling points on both x and y direction
+   const int N = k*k*k;
+   const int g = k-2;
+   const int NThread = 5;
+   double epsilon = 5.0e-7; //acceptable final error 
+   double amp = 1.0;
+   double sigma = 0.5; 
+   int totalStepslimit = 1000;
+    
+
+   // initial condition
+   int    steps = 0;                     // number of iterations
+   double phi[N]={0};
+   double rho[N];
+   double phi_ref[N]={0};
+   double err = 0;
+   double dx;
+   double dA;  
+   double phi_inner[g*g*g]={0};
+   double rho_inner[g*g*g];
+   double r[g*g*g];
+   double d[g*g*g];
+   double delta_new = 0;
+   double delta_final = 0;
+   double delta_old = 0;
+   double q[g*g*g]={0};
+   double alphaIn;
+   double betaIn;
+   int tid;
+   
+
+
+double rho_ref_func(double amp,double x, double y, double z){
+	   	double r = sqrt(  (x-L/2)*(x-L/2) + (y-L/2)*(y-L/2) + (z-L/2)*(z-L/2)  );
+	   	return amp*(4*r*r-6*sigma*sigma)/sigma/sigma/sigma/sigma*exp(-r*r/sigma/sigma);
+	}
+
+   
+// can be valid only on boundary
+double phi_ref_func( double amp, double x, double y, double z){
+	   double r = sqrt(  (x-L/2)*(x-L/2) + (y-L/2)*(y-L/2) + (z-L/2)*(z-L/2)  );
+       return amp*exp(-r*r/sigma/sigma);	
+    }
+    
+    // setting corners twice, which is useless but easy to understand
+void   phi_BC(double phi[N]){
+	    for(int s=0;s<N;s++)
+	    {
+	      int a = s/(k*k);   
+		  int b = s/k-a*k;
+		  int c = s%k;       // it can't be parallel by openmp(which let different thread use the same memory space)
+	      if(  a == 0 ||  a == k-1 || b == 0 ||  b == k-1 ||  c ==0 ||  c == k-1 )
+	      phi[s] = phi_ref_func(amp, a*dx, b*dx, c*dx);
+	      
+		}
+	   
+    }    
+   
+void   rho_BC(double rho[N]){
+	   for(int s=0; s<N; s++)
+	   {
+	   	int a = s/(k*k);   
+		int b = s/k-a*k;
+		int c = s%k;       // it can't be parallel by openmp(which let different thread use the same memory space)
+	    
+		if( a == 1)
+		rho[s] += phi[s-k*k]/dA;
+		else if( a == k-2)
+		rho[s] += phi[s+k*k]/dA;
+		
+		if( b == 1)
+		rho[s] += phi[s-k]/dA;
+		else if( b == k-2)
+		rho[s] += phi[s+k]/dA;
+		
+		if( c == 1)
+		rho[s] += phi[s-1]/dA;
+		else if( c == k-2)
+		rho[s] += phi[s+1]/dA;
+		
+	   }
+    } 
+    // it will give us the inner part of x 
+void   extract(double x_ext[g*g*g], double x[N] ){
+	   for(int alpha=0;alpha<g;alpha++)
+	    for(int beta=0;beta<g;beta++)
+	      for(int gamma=0;gamma<g;gamma++ )
+	      	x_ext[ alpha*g*g + beta*g + gamma ] = x[ (alpha+1)*k*k + (beta+1)*k + gamma+1];
+	}
+
+void   merge(double x_ext[g*g*g], double x[N]){
+	   for(int alpha=0;alpha<g;alpha++)
+	    for(int beta=0;beta<g;beta++)
+	      for(int gamma=0;gamma<g;gamma++ )
+	      	x[ (alpha+1)*k*k + (beta+1)*k + gamma+1] = x_ext[ alpha*g*g + beta*g + gamma ];
+	
+    }
+	
+	  
+//  r=b-Ax   matrix A belongs to M_g^3 * g^3       
+void   matrix_mult(double r[g*g*g],double b[g*g*g],double x[g*g*g]){
+	   //calculate 8 vertices first
+	   r[0] = b[0] +( -6*x[0] +x[1] +x[g] +x[g*g])/dA;
+	   r[g-1] = b[g-1] + ( -6*x[g-1] +x[g-2] +x[2*g-1] +x[g*g+g-1] )/dA;
+	   r[(g-1)*g] = b[(g-1)*g] + ( -6*x[(g-1)*g] +x[(g-1)*g+1] +x[(g-2)*g] +x[(2*g-1)*g] )/dA;
+	   r[g*g-1] = b[g*g-1] + ( -6*x[g*g-1] +x[g*g-2] +x[g*g-g-1] +x[2*g*g-1] )/dA;
+	   r[(g-1)*g*g] = b[(g-1)*g*g] + ( -6*x[(g-1)*g*g] +x[(g-1)*g*g+1] +x[(g-1)*g*g+g] +x[(g-2)*g*g] )/dA;
+	   r[(g-1)*(g*g+1)] = b[(g-1)*(g*g+1)] + ( -6*x[(g-1)*(g*g+1)] +x[(g-1)*(g*g+1)-1] +x[(g-1)*(g*g+1)+g] +x[g*(g-1)*(g-1)-1] )/dA;
+	   r[(g*g-1)*g] = b[(g*g-1)*g] + ( -6*x[(g*g-1)*g] +x[(g*g-1)*g+1] +x[(g*g-2)*g] +x[(g*g-1)*(g-1)-1] )/dA;
+	   r[g*g*g-1] = b[g*g*g-1] + ( -6*x[g*g*g-1] +x[g*g*g-2] +x[g*g*g-1-g] +x[g*g*(g-1)-1] )/dA;
+	   
+	   
+	   //calculate 12 edges next
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = 0, beta = 0
+	   {
+	   	int nu = gamma;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu+g]+x[nu+g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = 0, beta = g-1
+	   {
+	   	int nu = gamma+(g-1)*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g]+x[nu+g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = g-1, beta = 0
+	   {
+	   	int nu = gamma+(g-1)*g*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu+g]+x[nu-g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = g-1, beta = g-1
+	   {
+	   	int nu = gamma+(g*g-1)*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g]+x[nu-g*g])/dA;
+	   }
+	   //**************************************************************************//
+	   for(int beta=1;beta<g-1;beta++) //alpha = 0, gamma = 0
+	   {
+	   	int nu = beta*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu+1]+x[nu+g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = 0, gamma = g-1
+	   {
+	   	int nu = beta*g + g-1;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu-1]+x[nu+g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = g-1, gamma = 0
+	   {
+	   	int nu = beta*g + (g-1)*g*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu+1]+x[nu-g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = g-1, gamma = g-1
+	   {
+	   	int nu = beta*g+(g-1)*(g*g+1);
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu-1]+x[nu-g*g])/dA;
+	   }
+	   //**************************************************************************//
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = 0, gamma = 0
+	   {
+	   	int nu = alpha*g*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g*g] +x[nu+g*g] +x[nu+1]+x[nu+g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = 0, gamma = g-1
+	   {
+	   	int nu = alpha*g*g+g-1;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g*g] +x[nu+g*g] +x[nu-1]+x[nu+g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = g-1, gamma = 0
+	   {
+	   	int nu = alpha*g*g+(g-1)*g;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g*g] +x[nu+g*g] +x[nu+1]+x[nu-g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = g-1, gamma = g-1
+	   {
+	   	int nu = alpha*g*g+g*g-1;
+	   	r[nu] = b[nu] +( -6*x[nu] +x[nu-g*g] +x[nu+g*g] +x[nu-1]+x[nu-g])/dA;
+	   }
+	   
+	   
+	   
+	   //then calculate 6 faces
+	    for(int beta=1;beta<g-1;beta++)   // alpha = 0
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = beta*g+gamma;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g] +x[nu+g] +x[nu+g*g])/dA;
+		  }
+	    for(int beta=1;beta<g-1;beta++)   // alpha = g-1
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = beta*g+gamma+(g-1)*g*g;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g] +x[nu+g] +x[nu-g*g])/dA;
+		  }
+		//**************************************************************************//  
+	   	for(int alpha=1;alpha<g-1;alpha++)   // beta = 0
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = alpha*g*g+gamma;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g*g] +x[nu+g*g] +x[nu+g])/dA;
+		  }
+	   	for(int alpha=1;alpha<g-1;alpha++)   // beta = g-1
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = alpha*g*g+gamma+(g-1)*g;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-1] +x[nu+1] +x[nu-g*g] +x[nu+g*g] +x[nu-g])/dA;
+		  }
+	   	//**************************************************************************//  
+	   	for(int alpha=1;alpha<g-1;alpha++)   // gamma = 0
+	      for(int beta=1;beta<g-1;beta++) 
+	      {
+	      	int nu = alpha*g*g+beta*g;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu-g*g] +x[nu+g*g] +x[nu+1])/dA;
+		  }
+	   	for(int alpha=1;alpha<g-1;alpha++)   // gamma = g-1
+	      for(int beta=1;beta<g-1;beta++) 
+	      {
+	      	int nu = alpha*g*g+beta*g+g-1;
+	      	r[nu] = b[nu] +( -6*x[nu] +x[nu-g] +x[nu+g] +x[nu-g*g] +x[nu+g*g] +x[nu-1])/dA;
+		  }
+	   	
+	   
+	   //inner part  finally  //remember to collapse
+	 
+	   for(int alpha=1;alpha<g-1;alpha++)
+	   	 for(int beta=1;beta<g-1;beta++)
+	   	    for(int gamma =1;gamma<g-1;gamma++)
+	   	    {
+	   	    	int nu = alpha*g*g+beta*g+gamma;
+	   	    	r[nu]= b[nu] + ( -6*x[nu] + x[nu-1] + x[nu+1] + x[nu-g] + x[nu+g] + x[nu-g*g] + x[nu+g*g] )/dA;
+			}
+	   	 	
+		 
+    
+}    
+
+//  q=Ad    
+void   matrix_mult2(double q[g*g*g],double d[g*g*g]){
+	   q[0] =  (6*d[0] -d[1] -d[g] -d[g*g])/dA;
+	   q[g-1] =  (6*d[g-1] -d[g-2] -d[2*g-1] -d[g*g+g-1] )/dA;
+	   q[(g-1)*g] = ( 6*d[(g-1)*g] -d[(g-1)*g+1] -d[(g-2)*g] -d[(2*g-1)*g] )/dA;
+	   q[g*g-1] =( 6*d[g*g-1] -d[g*g-2] -d[g*g-g-1] -d[2*g*g-1] )/dA;
+	   q[(g-1)*g*g] = ( 6*d[(g-1)*g*g] -d[(g-1)*g*g+1] -d[(g-1)*g*g+g] -d[(g-2)*g*g] )/dA;
+	   q[(g-1)*(g*g+1)] =  ( 6*d[(g-1)*(g*g+1)] -d[(g-1)*(g*g+1)-1] -d[(g-1)*(g*g+1)+g] -d[g*(g-1)*(g-1)-1] )/dA;
+	   q[(g*g-1)*g] =( 6*d[(g*g-1)*g] -d[(g*g-1)*g+1] -d[(g*g-2)*g] -d[(g*g-1)*(g-1)-1] )/dA;
+	   q[g*g*g-1] =  ( 6*d[g*g*g-1] -d[g*g*g-2] -d[g*g*g-1-g] -d[g*g*(g-1)-1] )/dA;
+	   
+	   
+	   //calculate 12 edges next
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = 0, beta = 0
+	   {
+	   	int nu = gamma;
+	   	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu+g]-d[nu+g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = 0, beta = g-1
+	   {
+	   	int nu = gamma+(g-1)*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g]-d[nu+g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = g-1, beta = 0
+	   {
+	   	int nu = gamma+(g-1)*g*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu+g]-d[nu-g*g])/dA;
+	   }
+	   for(int gamma=1;gamma<g-1;gamma++) //alpha = g-1, beta = g-1
+	   {
+	   	int nu = gamma+(g*g-1)*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g]-d[nu-g*g])/dA;
+	   }
+	   //**************************************************************************//
+	   for(int beta=1;beta<g-1;beta++) //alpha = 0, gamma = 0
+	   {
+	   	int nu = beta*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu+1]-d[nu+g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = 0, gamma = g-1
+	   {
+	   	int nu = beta*g + g-1;
+	   	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu-1]-d[nu+g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = g-1, gamma = 0
+	   {
+	   	int nu = beta*g + (g-1)*g*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu+1]-d[nu-g*g])/dA;
+	   }
+	   for(int beta=1;beta<g-1;beta++) //alpha = g-1, gamma = g-1
+	   {
+	   	int nu = beta*g+(g-1)*(g*g+1);
+	   	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu-1]-d[nu-g*g])/dA;
+	   }
+	   //**************************************************************************//
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = 0, gamma = 0
+	   {
+	   	int nu = alpha*g*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-g*g] -d[nu+g*g] -d[nu+1]-d[nu+g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = 0, gamma = g-1
+	   {
+	   	int nu = alpha*g*g+g-1;
+	   	q[nu] = ( 6*d[nu] -d[nu-g*g] -d[nu+g*g] -d[nu-1]-d[nu+g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = g-1, gamma = 0
+	   {
+	   	int nu = alpha*g*g+(g-1)*g;
+	   	q[nu] = ( 6*d[nu] -d[nu-g*g] -d[nu+g*g] -d[nu+1]-d[nu-g])/dA;
+	   }
+	   for(int alpha=1;alpha<g-1;alpha++) //beta = g-1, gamma = g-1
+	   {
+	   	int nu = alpha*g*g+g*g-1;
+	   	q[nu] = ( 6*d[nu] -d[nu-g*g] -d[nu+g*g] -d[nu-1]-d[nu-g])/dA;
+	   }
+	   
+	   
+	   
+	   //then calculate 6 faces
+	    for(int beta=1;beta<g-1;beta++)   // alpha = 0
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = beta*g+gamma;
+	      	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g] -d[nu+g] -d[nu+g*g])/dA;
+		  }
+	    for(int beta=1;beta<g-1;beta++)   // alpha = g-1
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = beta*g+gamma+(g-1)*g*g;
+	      	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g] -d[nu+g] -d[nu-g*g])/dA;
+		  }
+		//**************************************************************************//  
+	   	for(int alpha=1;alpha<g-1;alpha++)   // beta = 0
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = alpha*g*g+gamma;
+	      	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g*g] -d[nu+g*g] -d[nu+g])/dA;
+		  }
+	   	for(int alpha=1;alpha<g-1;alpha++)   // beta = g-1
+	      for(int gamma=1;gamma<g-1;gamma++) 
+	      {
+	      	int nu = alpha*g*g+gamma+(g-1)*g;
+	      	q[nu] = ( 6*d[nu] -d[nu-1] -d[nu+1] -d[nu-g*g] -d[nu+g*g] -d[nu-g])/dA;
+		  }
+	   	//**************************************************************************//  
+	   	for(int alpha=1;alpha<g-1;alpha++)   // gamma = 0
+	      for(int beta=1;beta<g-1;beta++) 
+	      {
+	      	int nu = alpha*g*g+beta*g;
+	      	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu-g*g] -d[nu+g*g] -d[nu+1])/dA;
+		  }
+	   	for(int alpha=1;alpha<g-1;alpha++)   // gamma = g-1
+	      for(int beta=1;beta<g-1;beta++) 
+	      {
+	      	int nu = alpha*g*g+beta*g+g-1;
+	      	q[nu] = ( 6*d[nu] -d[nu-g] -d[nu+g] -d[nu-g*g] -d[nu+g*g] -d[nu-1])/dA;
+		  }
+	   	
+	   
+	   //inner part  finally  //remember to collapse
+	 
+	   for(int alpha=1;alpha<g-1;alpha++)
+	   	 for(int beta=1;beta<g-1;beta++)
+	   	    for(int gamma =1;gamma<g-1;gamma++)
+	   	    {
+	   	    	int nu = alpha*g*g+beta*g+gamma;
+	   	    	q[nu]= ( 6*d[nu] - d[nu-1] - d[nu+1] - d[nu-g] - d[nu+g] - d[nu-g*g] - d[nu+g*g] )/dA;
+			}
+	   	 	
+		 
+}    
+
+
+//innner product = d^T*q
+double inn_product(double d[g*g*g],double q[g*g*g]){
+	   double temp = 0;
+	   for(int i=0;i<g*g*g;i++)
+	   {
+	   	temp += q[i]*d[i];
+	   }
+	 return temp;
+    }
+
+
+
+ int main( int argc, char *argv[] )
+ {
+ 	
+ 	//set the thread number 
+ 	//omp_set_num_threads( 6 );
+ 	
+ 	
+   // derived constants 
+  dx      = L/(k-1);    //spatial resolution
+  dA      = dx*dx;
+
+     
+    
+	
+	//initialize rho to reference function 
+	 for(int s=0;s<N;s++)
+    { //rho must have negative sign so that A can be positive-definite
+      int a = s/(k*k);   
+	  int b = s/k-a*k;
+	  int c = s%k; 
+	  rho[s] = -rho_ref_func( amp, a*dx, b*dx, c*dx );
+	  phi_ref[s] = phi_ref_func( amp, a*dx, b*dx, c*dx );
+	  
+ 	}
+
+	
+ 	
+    phi_BC(phi);   
+	// use rho to force phi maintaining boundary condition 
+	rho_BC(rho);
+	
+	// extract the inner part which we need solve
+	extract(rho_inner,rho); 
+    
+    
+
+     
+// The CG iteration part (start to parellel)
+    
+	 //r=b-Ax 
+	 // In fact, phi_inner is zero so r = b
+	 matrix_mult(r,rho_inner,phi_inner);
+	 //d=r
+     for(int i=0;i<g*g*g;i++)
+     {
+        d[i] = r[i];	
+     }
+     //delta_new = <r,r>
+     delta_new = inn_product(r,r);
+    
+     delta_final = epsilon*epsilon*delta_new;
+     
+     
+    
+	//loop
+    for(int stepNumber= 0; stepNumber< totalStepslimit; stepNumber++ )     // stepNumber is "steps"
+   {                                   
+     
+       
+       
+       //tid = omp_get_thread_num();	
+       
+       
+	   matrix_mult2(q,d);
+     
+       alphaIn = delta_new/inn_product(d,q);
+       
+	   
+       for(int i=0;i<g*g*g;i++)
+         phi_inner[i] = phi_inner[i] + alphaIn*d[i];
+        
+       
+        
+	   // this correction is used only in the very acurate demand
+	   if( stepNumber == g*g )
+          matrix_mult(r,rho_inner,phi_inner);
+
+	   else
+	     {
+	       
+	       for(int i=0;i<g*g*g;i++)
+	          r[i] = r[i]-alphaIn*q[i];
+           
+         }
+	
+	   delta_old = delta_new;
+	   delta_new = inn_product(r,r);
+	   betaIn = delta_new/delta_old;
+	
+	   
+	    for(int i=0;i<g*g*g;i++)
+          d[i]=r[i]+betaIn*d[i];  
+		  
+       	
+	 
+       merge(phi_inner,phi); 	
+	    
+     
+    err = 0;
+    for(int i=0;i<N;i++)
+    err+= abs((phi[i]-phi_ref[i])/phi_ref[i]);
+    
+    err/=float (g*g*g);          //normalization
+
+    steps++;       //  update steps
+    if(steps %1 == 0) 
+	printf("steps = %d  err= %10.3e \n",steps, err);
+    
+	if(delta_new<delta_final)
+	   break;
+
+   }
+   
+
+   
+
+  printf("steps = %d  fin_err= %10.3e \n",steps, err);
+  return EXIT_SUCCESS;
+ }
+	
+	
